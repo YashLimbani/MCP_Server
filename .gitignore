@@ -1,0 +1,21 @@
+
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# Downloaded API responses
+samples/*.json
+
+# Dependencies
+node_modules/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# OS files
+.DS_Store
+Thumbs.db

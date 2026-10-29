@@ -1,0 +1,11 @@
+my-mcp-server/
+├── src/my_mcp_server/
+│   ├── server.py      # tool/resource/prompt registration
+│   ├── client.py      # API wrapper (auth, retries, rate limiting)
+│   ├── models.py      # pydantic schemas
+│   └── errors.py
+├── tests/
+├── README.md
+├── DESIGN.md
+├── pyproject.toml
+└── LICENSE
