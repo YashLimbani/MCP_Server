@@ -336,3 +336,169 @@ def test_get_question_not_found():
     with pytest.raises(NotFound) as err:
         run(client.get_question(999, site="serverfault"))
     assert "999" in str(err.value) and "serverfault" in str(err.value)
+
+
+# --- validation and hints ---------------------------------------------------------------
+def test_invalid_tags_are_rejected_before_any_request():
+    client, _, calls = make(lambda r: ok(SEARCH))
+    for bad in (["two words"], ["a;b"], [""]):
+        with pytest.raises(InvalidInput):
+            run(client.search_questions("x", tags=bad))
+    assert calls == []
+
+
+def test_empty_results_carry_a_helpful_note():
+    client, _, _ = make(lambda r: ok({"items": [], "has_more": False}))
+    result = run(client.search_questions("zzzz"))
+    assert result.results == []
+    assert "search_tags" in result.note
+
+
+def test_normal_results_have_no_note():
+    client, _, _ = make(lambda r: ok(SEARCH))
+    assert run(client.search_questions("x")).note is None
+
+
+# --- search_by_error_message --------------------------------------------------------------
+def test_error_search_cleans_the_message_and_reports_the_query():
+    trace = (
+        "Traceback (most recent call last):\n"
+        '  File "/home/me/app.py", line 12, in <module>\n'
+        "AttributeError: 'NoneType' object has no attribute 'foo'\n"
+    )
+    client, _, calls = make(lambda r: ok(SEARCH))
+    result = run(client.search_by_error_message(trace, tags=["python"], limit=4))
+    params = calls[0].url.params
+    assert params.get("q") == "AttributeError: 'NoneType' object has no attribute 'foo'"
+    assert params.get("sort") == "relevance"
+    assert params.get("tagged") == "python"
+    assert params.get("pagesize") == "4"
+    assert result.cleaned_query == params.get("q")
+    assert len(result.results) == 3
+
+
+def test_error_search_rejects_empty_input():
+    client, _, calls = make(lambda r: ok(SEARCH))
+    with pytest.raises(InvalidInput):
+        run(client.search_by_error_message("   "))
+    assert calls == []
+
+
+# --- tags (real API samples) -----------------------------------------------------------------
+TAGS = json.loads((SAMPLES / "tags.json").read_text())
+TAG_WIKI = json.loads((SAMPLES / "tag_wiki.json").read_text())
+SITES = json.loads((SAMPLES / "sites.json").read_text())
+# /tags/{tag}/info returns the same Tag objects as /tags, so reuse the first sample item.
+TAG_INFO = {"items": [TAGS["items"][0]], "has_more": False}
+
+
+def test_search_tags_params_and_parsing():
+    client, _, calls = make(lambda r: ok(TAGS))
+    result = run(client.search_tags("asyncio", limit=3))
+    params = calls[0].url.params
+    assert calls[0].url.path == "/2.3/tags"
+    assert params.get("inname") == "asyncio"
+    assert params.get("sort") == "popular"
+    assert params.get("pagesize") == "3"
+    assert [t.name for t in result.tags] == ["python-asyncio", "pytest-asyncio", "nest-asyncio"]
+    assert result.tags[0].count == 7945
+    assert result.tags[0].has_synonyms is True
+    assert result.tags[1].has_synonyms is False
+    assert result.has_more is True
+    assert "is_moderator_only" not in result.model_dump_json()
+
+
+def tag_router(wiki=TAG_WIKI, info=TAG_INFO):
+    def responder(request):
+        path = request.url.path
+        if path == "/2.3/tags/python-asyncio/info":
+            return ok(info)
+        if path == "/2.3/tags/python-asyncio/wikis":
+            return ok(wiki)
+        if path == "/2.3/search/advanced":
+            return ok(SEARCH)
+        return ok({"items": []})
+
+    return responder
+
+
+def test_tag_overview_combines_info_wiki_and_top_questions():
+    client, _, calls = make(tag_router())
+    overview = run(client.get_tag_overview("python-asyncio", top_questions=2))
+    assert len(calls) == 3
+    assert overview.tag == "python-asyncio"
+    assert overview.question_count == 7945
+    assert overview.summary == TAG_WIKI["items"][0]["excerpt"]
+    assert len(overview.top_questions) == 3  # the sample search returns 3 items
+    search_call = next(c for c in calls if c.url.path == "/2.3/search/advanced")
+    assert search_call.url.params.get("tagged") == "python-asyncio"
+    assert search_call.url.params.get("sort") == "votes"
+    assert search_call.url.params.get("pagesize") == "2"
+    assert "q" not in search_call.url.params
+
+
+def test_tag_overview_without_top_questions_makes_two_calls():
+    client, _, calls = make(tag_router())
+    overview = run(client.get_tag_overview("python-asyncio", top_questions=0))
+    assert len(calls) == 2
+    assert overview.top_questions == []
+
+
+def test_tag_without_wiki_has_no_summary():
+    client, _, _ = make(tag_router(wiki={"items": [], "has_more": False}))
+    overview = run(client.get_tag_overview("python-asyncio", top_questions=0))
+    assert overview.summary is None
+
+
+def test_wiki_excerpt_with_html_is_converted_defensively():
+    wiki = {"items": [{"tag_name": "python-asyncio", "excerpt": "An <b>async</b> library &amp; more."}]}
+    client, _, _ = make(tag_router(wiki=wiki))
+    overview = run(client.get_tag_overview("python-asyncio", top_questions=0))
+    assert overview.summary == "An **async** library & more."
+
+
+def test_unknown_tag_raises_not_found_with_advice():
+    client, _, _ = make(lambda r: ok({"items": [], "has_more": False}))
+    with pytest.raises(NotFound) as err:
+        run(client.get_tag_overview("nope", top_questions=0))
+    assert "search_tags" in str(err.value)
+
+
+def test_special_characters_in_tag_names_are_percent_encoded():
+    client, _, calls = make(lambda r: ok({"items": [{"name": "c#", "count": 1}]}))
+    run(client.get_tag_overview("c#", top_questions=0))
+    assert any(b"/tags/c%23/info" in c.url.raw_path for c in calls)
+
+
+# --- sites (real API sample) ------------------------------------------------------------------
+def extra_site(slug, name, site_type="main_site", audience="for pros &amp; enthusiasts"):
+    return {
+        "api_site_parameter": slug,
+        "name": name,
+        "site_url": f"https://{slug}.com",
+        "site_type": site_type,
+        "audience": audience,
+    }
+
+
+def test_list_sites_filters_meta_pages_through_results_and_caches_for_a_day():
+    page1 = {**SITES, "items": SITES["items"] + [extra_site("meta.stackoverflow", "Meta", "meta_site")]}
+    page2 = {"items": [extra_site("askubuntu", "Ask Ubuntu")], "has_more": False}
+    pages = {"1": page1, "2": page2}
+    client, t, calls = make(lambda r: ok(pages[r.url.params.get("page")]), cache_ttl=300)
+
+    sites = run(client.list_sites())
+    assert [s.slug for s in sites] == ["stackoverflow", "serverfault", "superuser", "askubuntu"]
+    assert sites[0].name == "Stack Overflow"
+    assert sites[0].url == "https://stackoverflow.com"
+    assert sites[0].audience == "professional and enthusiast programmers"
+    assert sites[3].audience == "for pros & enthusiasts"  # HTML entities are decoded
+    assert "styling" not in sites[0].model_dump_json()
+    assert len(calls) == 2
+
+    t.now += 3600  # an hour later: still served from the long-lived cache
+    run(client.list_sites())
+    assert len(calls) == 2
+    t.now += 25 * 3600
+    run(client.list_sites())
+    assert len(calls) == 4

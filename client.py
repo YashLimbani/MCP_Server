@@ -13,6 +13,7 @@ import re
 import time
 from datetime import date, datetime, timezone
 from typing import Any, Awaitable, Callable, Literal
+from urllib.parse import quote
 
 import httpx
 
@@ -27,17 +28,27 @@ from errors import (
 )
 from models import (
     DEFAULT_MAX_BODY_CHARS,
+    ErrorSearchResult,
     QuestionDetail,
     QuotaInfo,
     QuotaStatus,
     SearchResult,
+    SiteInfo,
+    TagOverview,
+    TagSearchResult,
 )
+from textclean import clean_error_message
 
 log = logging.getLogger(__name__)
 
 API_BASE = "https://api.stackexchange.com/2.3"
 # A throttle error that asks us to wait longer than this means the DAILY quota is used up.
 DAILY_QUOTA_THRESHOLD_SECONDS = 600
+SITES_CACHE_TTL = 24 * 3600.0  # the list of sites almost never changes
+NO_RESULTS_HINT = (
+    "No results. Try fewer or broader keywords, remove tags, or use search_tags "
+    "to find valid tag names."
+)
 
 Sort = Literal["relevance", "votes", "activity", "creation"]
 
@@ -103,8 +114,14 @@ class StackExchangeClient:
         await self.aclose()
 
     # --- core request pipeline --------------------------------------------------
-    async def request(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """GET an API method and return the parsed JSON payload (cached briefly)."""
+    async def request(
+        self, path: str, params: dict[str, Any] | None = None, *, cache_ttl: float | None = None
+    ) -> dict[str, Any]:
+        """GET an API method and return the parsed JSON payload (cached briefly).
+
+        cache_ttl overrides the default cache lifetime, unless caching is disabled.
+        """
+        ttl = cache_ttl if (cache_ttl is not None and self._cache_ttl > 0) else self._cache_ttl
         params = {k: v for k, v in (params or {}).items() if v is not None}
         cache_key = (path, tuple(sorted((k, str(v)) for k, v in params.items())))
         hit = self._cache.get(cache_key)
@@ -114,11 +131,11 @@ class StackExchangeClient:
         self._check_quota()
         payload = await self._fetch(path, params)
 
-        if self._cache_ttl > 0:
+        if ttl > 0:
             if len(self._cache) > 256:  # keep memory bounded
                 now = self._clock()
                 self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
-            self._cache[cache_key] = (self._clock() + self._cache_ttl, payload)
+            self._cache[cache_key] = (self._clock() + ttl, payload)
         return payload
 
     async def _fetch(self, path: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -245,15 +262,22 @@ class StackExchangeClient:
         )
 
     # --- high-level operations ----------------------------------------------------
+    @staticmethod
+    def _validate_tags(tags: list[str]) -> None:
+        for tag in tags:
+            if not tag or re.search(r"[\s;]", tag):
+                raise InvalidInput(f"tag {tag!r} is not valid (tags cannot contain spaces or ';')")
+
     async def search_questions(
         self,
-        query: str,
+        query: str | None,
         tags: list[str] | None = None,
         site: str = "stackoverflow",
         sort: Sort = "relevance",
         accepted_only: bool = False,
         limit: int = 5,
     ) -> SearchResult:
+        self._validate_tags(tags or [])
         payload = await self.request(
             "/search/advanced",
             {
@@ -266,7 +290,78 @@ class StackExchangeClient:
                 "site": site,
             },
         )
-        return SearchResult.from_api(payload)
+        result = SearchResult.from_api(payload)
+        if not result.results:
+            result.note = NO_RESULTS_HINT
+        return result
+
+    async def search_by_error_message(
+        self,
+        error_message: str,
+        tags: list[str] | None = None,
+        site: str = "stackoverflow",
+        limit: int = 5,
+    ) -> ErrorSearchResult:
+        cleaned = clean_error_message(error_message)
+        if not cleaned:
+            raise InvalidInput("the error message is empty")
+        result = await self.search_questions(cleaned, tags, site, "relevance", False, limit)
+        return ErrorSearchResult(
+            results=result.results,
+            has_more=result.has_more,
+            note=result.note,
+            cleaned_query=cleaned,
+        )
+
+    async def search_tags(
+        self, query: str, site: str = "stackoverflow", limit: int = 10
+    ) -> TagSearchResult:
+        payload = await self.request(
+            "/tags",
+            {"inname": query, "sort": "popular", "order": "desc", "pagesize": limit, "site": site},
+        )
+        return TagSearchResult.from_api(payload)
+
+    async def get_tag_overview(
+        self, tag: str, site: str = "stackoverflow", top_questions: int = 3
+    ) -> TagOverview:
+        self._validate_tags([tag])
+        name = quote(tag, safe="")  # tags can contain characters like '#' and '+'
+        calls = [
+            self.request(f"/tags/{name}/info", {"site": site}),
+            self.request(f"/tags/{name}/wikis", {"site": site}),
+        ]
+        if top_questions > 0:
+            calls.append(
+                self.search_questions(None, [tag], site, "votes", False, top_questions)
+            )
+        info_payload, wiki_payload, *rest = await asyncio.gather(*calls)
+
+        info_items = info_payload.get("items", [])
+        if not info_items:
+            raise NotFound(
+                f"Tag '{tag}' was not found on {site}. Use search_tags to find the exact tag name."
+            )
+        wiki_items = wiki_payload.get("items", [])
+        return TagOverview.from_api(
+            tag, info_items[0], wiki_items[0] if wiki_items else None, rest[0] if rest else None
+        )
+
+    async def list_sites(self) -> list[SiteInfo]:
+        """All main Stack Exchange sites (meta sites excluded), cached for a day."""
+        sites: list[SiteInfo] = []
+        for page in range(1, 6):
+            payload = await self.request(
+                "/sites", {"pagesize": 100, "page": page}, cache_ttl=SITES_CACHE_TTL
+            )
+            sites += [
+                SiteInfo.from_api(i)
+                for i in payload.get("items", [])
+                if i.get("site_type") == "main_site"
+            ]
+            if not payload.get("has_more"):
+                break
+        return sites
 
     async def get_question(
         self, question_id: int, site: str = "stackoverflow", max_answers: int = 3

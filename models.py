@@ -62,6 +62,7 @@ class QuestionSummary(BaseModel):
 class SearchResult(BaseModel):
     results: list[QuestionSummary]
     has_more: bool
+    note: str | None = None  # a hint for the model, e.g. when nothing matched
 
     @classmethod
     def from_api(cls, payload: dict[str, Any]) -> "SearchResult":
@@ -176,3 +177,78 @@ class QuotaStatus(BaseModel):
     quota_max: int | None
     authenticated: bool  # True when STACKEXCHANGE_KEY is set
     backoff_seconds_remaining: int | None  # None when no backoff is active
+
+
+class ErrorSearchResult(SearchResult):
+    """Output of search_by_error_message: shows what was actually searched."""
+
+    cleaned_query: str
+
+
+class TagInfo(BaseModel):
+    name: str
+    count: int
+    has_synonyms: bool
+
+
+class TagSearchResult(BaseModel):
+    tags: list[TagInfo]
+    has_more: bool
+
+    @classmethod
+    def from_api(cls, payload: dict[str, Any]) -> "TagSearchResult":
+        return cls(
+            tags=[
+                TagInfo(
+                    name=i["name"],
+                    count=i.get("count", 0),
+                    has_synonyms=bool(i.get("has_synonyms", False)),
+                )
+                for i in payload.get("items", [])
+            ],
+            has_more=payload.get("has_more", False),
+        )
+
+
+class TagOverview(BaseModel):
+    """Output of get_tag_overview."""
+
+    tag: str
+    question_count: int | None
+    summary: str | None  # the tag's wiki excerpt, when it has one
+    top_questions: list[QuestionSummary]
+
+    @classmethod
+    def from_api(
+        cls,
+        tag: str,
+        info_item: dict[str, Any],
+        wiki_item: dict[str, Any] | None,
+        top: SearchResult | None,
+    ) -> "TagOverview":
+        summary = None
+        if wiki_item and wiki_item.get("excerpt"):
+            summary = truncate_text(html_to_markdown(wiki_item["excerpt"]), 600) or None
+        return cls(
+            tag=info_item.get("name", tag),
+            question_count=info_item.get("count"),
+            summary=summary,
+            top_questions=top.results if top else [],
+        )
+
+
+class SiteInfo(BaseModel):
+    slug: str  # the value to pass as `site`
+    name: str
+    url: str
+    audience: str | None
+
+    @classmethod
+    def from_api(cls, item: dict[str, Any]) -> "SiteInfo":
+        audience = html.unescape(item.get("audience") or "").strip()
+        return cls(
+            slug=item["api_site_parameter"],
+            name=html.unescape(item["name"]),
+            url=item["site_url"],
+            audience=audience or None,
+        )
