@@ -167,3 +167,12 @@ class QuotaInfo(BaseModel):
             quota_remaining=payload.get("quota_remaining"),
             backoff_seconds=payload.get("backoff"),
         )
+
+
+class QuotaStatus(BaseModel):
+    """Output of get_quota_status."""
+
+    quota_remaining: int | None
+    quota_max: int | None
+    authenticated: bool  # True when STACKEXCHANGE_KEY is set
+    backoff_seconds_remaining: int | None  # None when no backoff is active
